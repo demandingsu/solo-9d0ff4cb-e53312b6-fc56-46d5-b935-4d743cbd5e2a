@@ -133,6 +133,27 @@ def _demo_presets() -> list[dict[str, str]]:
             "section_no": "A",
             "note": "A 包；结果公告不应改变截止时间",
         },
+        {
+            "name": "终止后又出现截止时间",
+            "list_url": DEMO_LIST_URL,
+            "project_no": "DEMO-2026-004",
+            "section_no": "C",
+            "note": "原公告第 4 页，终止在第 6 页；终止后的延期公告保留来源但不恢复有效时间",
+        },
+        {
+            "name": "待定后仅更正非时间事项",
+            "list_url": DEMO_LIST_URL,
+            "project_no": "DEMO-2026-005",
+            "section_no": "D",
+            "note": "延期时间待定后只更正保证金账户；旧期限不得恢复，结论为无法判定",
+        },
+        {
+            "name": "待定后明确新时间",
+            "list_url": DEMO_LIST_URL,
+            "project_no": "DEMO-2026-006",
+            "section_no": "E",
+            "note": "先待定，后续公告明确新截止时间后期限恢复",
+        },
     ]
     for preset in presets:
         preset["href"] = "/check?" + urlencode(

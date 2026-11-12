@@ -333,7 +333,7 @@ POSITIVE_MARKER_RE = re.compile(
     r"现为|现定于|确定为)"
 )
 OLD_MARKER_RE = re.compile(r"(?:原投标|原响应|原定|原计划|原先|此前|之前|曾经|曾|由)")
-POSTPONE_RE = re.compile(r"(?:延期|推迟|顺延|延长|暂缓|另行通知|另行公告|另行确定|待定)")
+PENDING_WORD_RE = re.compile(r"(?:另行通知|另行公告|另行确定|待定|暂缓)")
 
 
 def _deadline_label_candidates(text: str) -> list[dict[str, Any]]:
@@ -472,9 +472,13 @@ def extract_deadline(
         old = next((item for item in label_candidates if item["old"]), None)
         if old is None and label_candidates:
             old = label_candidates[-1]
+        # ``is_postponement`` reflects the notice's own title; the tail scan is
+        # limited to "time to be determined" wording so that a generic extension
+        # type tag (e.g. a page chrome label) cannot make a plain correction
+        # notice look like an open-ended postponement.
         unclear = bool(
             is_postponement
-            or POSTPONE_RE.search(text[-300:])
+            or PENDING_WORD_RE.search(text[-300:])
             or any(item["ambiguous"] for item in label_candidates)
         )
         return DeadlineInfo(
@@ -593,7 +597,13 @@ def parse_notice_html(html: str, url: str, date_hint: str | None = None) -> Pars
         if normalized_type in aliases:
             notice_type = aliases[normalized_type]
             if notice_type == "extension":
-                is_postponement = bool(re.search(r"延期|推迟|顺延|延长", text))
+                # A postponement is declared by the notice's own title, not by
+                # the generic extension type tag or by incidental words in the
+                # body: a correction notice (更正公告) that merely discusses an
+                # earlier postponement is not itself a postponement.
+                is_postponement = bool(
+                    re.search(r"延期|推迟|顺延|延长|暂缓", title)
+                )
 
     deadline_data = _data_attr(
         soup, ("data-deadline", "data-bid-deadline", "data-deadline-time")
@@ -927,52 +937,108 @@ async def _fetch(
 
 
 def _build_changes(records: Sequence[NoticeRecord], original: NoticeRecord | None) -> list[dict[str, Any]]:
+    """Build the per-notice change timeline.
+
+    The timeline state machine mirrors the final reconciliation:
+
+    * ``terminated`` latches on once a termination notice is applied.  Later
+      notices are still retained as sources, but none of them may restore an
+      effective deadline.
+    * ``pending`` latches on when an extension leaves the new date to be
+      determined.  It only clears when a later notice explicitly gives a new
+      deadline; a correction that merely repeats the old date or changes
+      non-time matters never revives the old deadline.
+    """
+
     changes: list[dict[str, Any]] = []
     effective: datetime | None = original.parsed.deadline.value if original else None
     effective_has_time = original.parsed.deadline.has_time if original else True
+    terminated = False
+    pending = False
     for record in records:
         parsed = record.parsed
         if parsed.notice_type not in {"original", "extension", "terminated"}:
             continue
         type_label = TYPE_LABELS.get(parsed.notice_type, "公告")
         summary = ""
-        deadline_after: datetime | None = effective if parsed.notice_type != "terminated" else None
+        deadline_after: datetime | None
         deadline_after_has_time = effective_has_time
+        deadline_raw_after: str | None = None
+
         if parsed.notice_type == "original":
             initial = parsed.deadline.value
             effective = initial
             effective_has_time = parsed.deadline.has_time
+            pending = False
             summary = (
                 f"发布原公告，投标截止时间为 "
                 f"{format_dt(initial, include_time=parsed.deadline.has_time) or '未明确'}。"
             )
-        elif parsed.notice_type == "extension":
-            if parsed.deadline.explicit and parsed.deadline.value:
-                before = effective
-                before_has_time = effective_has_time
-                effective = parsed.deadline.value
-                effective_has_time = parsed.deadline.has_time
-                if before:
-                    summary = (
-                        f"截止时间由 {format_dt(before, include_time=before_has_time)} 调整为 "
-                        f"{format_dt(parsed.deadline.value, include_time=parsed.deadline.has_time)}。"
-                    )
-                else:
-                    summary = (
-                        "延期公告将截止时间明确为 "
-                        f"{format_dt(parsed.deadline.value, include_time=parsed.deadline.has_time)}。"
-                    )
-                deadline_after = effective
-                deadline_after_has_time = effective_has_time
-            elif parsed.deadline.unclear:
-                summary = "延期公告未明确新的截止时间；原截止时间不能直接视为有效。"
-                deadline_after = None
-            else:
-                summary = "该公告未明确修改投标截止时间。"
-                deadline_after = effective
-        else:
+            # Defensive: an original notice published after a termination never
+            # overrides the terminal state on the timeline.
+            deadline_after = None if terminated else initial
+            if not terminated and parsed.deadline.explicit:
+                deadline_raw_after = parsed.deadline.raw
+
+        elif parsed.notice_type == "terminated":
+            terminated = True
+            pending = False
+            effective = None
+            effective_has_time = True
             summary = "项目终止，投标截止时间不再有效，不应继续按原时间准备投标。"
             deadline_after = None
+
+        elif terminated:
+            # Keep the source for the audit trail, but a terminated lot has no
+            # effective deadline for any later notice to carry.
+            if parsed.deadline.explicit and parsed.deadline.value:
+                summary = (
+                    "该公告发布于终止公告之后，虽载明截止时间 "
+                    f"{format_dt(parsed.deadline.value, include_time=parsed.deadline.has_time)}，"
+                    "但项目已终止，该时间不产生有效截止时间。"
+                )
+            else:
+                summary = "该公告发布于终止公告之后；项目已终止，投标截止时间保持失效。"
+            deadline_after = None
+
+        elif parsed.deadline.explicit and parsed.deadline.value:
+            before = effective
+            before_has_time = effective_has_time
+            effective = parsed.deadline.value
+            effective_has_time = parsed.deadline.has_time
+            pending = False
+            if before:
+                summary = (
+                    f"截止时间由 {format_dt(before, include_time=before_has_time)} 调整为 "
+                    f"{format_dt(parsed.deadline.value, include_time=parsed.deadline.has_time)}。"
+                )
+            else:
+                summary = (
+                    "公告明确了新的投标截止时间 "
+                    f"{format_dt(parsed.deadline.value, include_time=parsed.deadline.has_time)}，"
+                    "截止时间恢复为可判定状态。"
+                )
+            deadline_after = effective
+            deadline_after_has_time = effective_has_time
+            deadline_raw_after = parsed.deadline.raw
+
+        elif parsed.deadline.unclear:
+            pending = True
+            effective = None
+            effective_has_time = True
+            summary = "延期公告未明确新的截止时间；原截止时间不能直接视为有效。"
+            deadline_after = None
+
+        else:
+            if pending:
+                summary = (
+                    "该公告仅更正非时间事项，未给出新的截止时间；"
+                    "此前延期时间仍待定，旧期限不得恢复为有效时间。"
+                )
+            else:
+                summary = "该公告未明确修改投标截止时间。"
+            deadline_after = effective
+
         changes.append(
             {
                 "published_at": format_dt(parsed.published_at, parsed.published_has_time),
@@ -985,7 +1051,7 @@ def _build_changes(records: Sequence[NoticeRecord], original: NoticeRecord | Non
                 "deadline_after": format_dt(
                     deadline_after, include_time=deadline_after_has_time
                 ),
-                "deadline_raw_after": parsed.deadline.raw if parsed.deadline.explicit else None,
+                "deadline_raw_after": deadline_raw_after,
             }
         )
     return changes
@@ -1284,8 +1350,10 @@ async def check_lot(
         status_code = "ongoing"
         status_label = "进行中"
         extension_applied = False
-        unclear_extension = False
-        unclear_source: NoticeRecord | None = None
+        # Once an extension leaves the date to be determined, the lot stays
+        # pending until a later notice explicitly states a new deadline.
+        pending = False
+        pending_source: NoticeRecord | None = None
         terminated = False
 
         for record in ordered:
@@ -1298,9 +1366,12 @@ async def check_lot(
                 effective_raw = None
                 source_url = record.source_url
                 source_title = parsed.title
-                unclear_extension = False
+                pending = False
+                pending_source = None
                 continue
             if terminated:
+                # Termination is final: later notices (even ones quoting a
+                # deadline) never restore an effective submission deadline.
                 continue
             if parsed.notice_type == "extension":
                 if parsed.deadline.explicit and parsed.deadline.value is not None:
@@ -1310,34 +1381,42 @@ async def check_lot(
                     source_url = record.source_url
                     source_title = parsed.title
                     extension_applied = True
-                    unclear_extension = False
+                    pending = False
+                    pending_source = None
                 elif parsed.deadline.unclear:
-                    unclear_extension = True
-                    unclear_source = record
+                    pending = True
+                    pending_source = record
                     effective = None
                     effective_raw = None
                     source_url = record.source_url
                     source_title = parsed.title
+                # An extension that neither gives a new date nor says the date
+                # is pending (e.g. a correction to non-time matters) changes
+                # nothing: an existing pending state must not be cleared and an
+                # existing deadline must not be replaced.
 
         if terminated:
             status_code = "terminated"
             status_label = "已终止（不再接受投标）"
             effective = None
             effective_raw = None
-            reason = "项目已发布终止公告，原投标截止时间不再有效。"
-        elif unclear_extension:
+            reason = "项目已发布终止公告；终止后公告仅保留来源，不再产生有效截止时间。"
+        elif pending:
             status_code = "unknown"
             status_label = "无法判定"
             determinable = False
-            reason = "延期公告未明确新的投标截止时间，不能沿用旧时间。"
+            reason = (
+                "延期公告将新截止时间定为待定，后续公告也未明确给出新的投标截止时间，"
+                "不能沿用旧时间。"
+            )
             effective = None
             effective_raw = None
             source_url = None
             source_title = None
-            if unclear_source is not None:
+            if pending_source is not None:
                 _problem(
                     issues,
-                    unclear_source.source_url,
+                    pending_source.source_url,
                     "延期公告未给出新的明确截止时间，旧截止时间不能继续作为有效时间",
                     "parse",
                 )

@@ -206,6 +206,128 @@ class CrawlerTests(unittest.IsolatedAsyncioTestCase):
             result["deadline_source_url"], "http://test/d/extension"
         )
 
+    async def test_extension_after_termination_never_restores_deadline(self):
+        """终止后又出现载明截止时间的公告：保留来源，但不产生有效时间。"""
+
+        late_extension = detail(
+            "P-001", "01", "extension", "2026-10-25 09:00",
+            "原投标截止时间为2026年11月09日 09:30，现延期至：2026年11月16日 09:30。",
+            "延期公告",
+        )
+        routes = {
+            "/list": link_list(
+                "P-001", "01", ["/d/original", "/d/extension"], next_href="/list2"
+            ),
+            "/list2": link_list(
+                "P-001", "01", ["/d/termination"], next_href="/list3"
+            ),
+            "/list3": link_list("P-001", "01", ["/d/late-extension"]),
+            "/d/original": ORIGINAL,
+            "/d/extension": EXTENSION,
+            "/d/termination": TERMINATION,
+            "/d/late-extension": late_extension,
+        }
+        result = (
+            await check_lot(
+                "http://test/list", "P-001", "01",
+                client_factory=self.make_factory(routes),
+            )
+        ).as_dict()
+        self.assertEqual(result["status"], "terminated")
+        self.assertTrue(result["determinable"])
+        self.assertIsNone(result["effective_deadline"])
+        # The late notice is retained as a source ...
+        self.assertEqual(
+            [change["type"] for change in result["changes"]],
+            ["original", "extension", "terminated", "extension"],
+        )
+        late_change = result["changes"][-1]
+        # ... but its row must not present any valid deadline.
+        self.assertIsNone(late_change["deadline_after"])
+        self.assertIn("终止", late_change["summary"])
+        self.assertTrue(all(change["url"] for change in result["changes"]))
+
+    async def test_correction_after_pending_deadline_does_not_revive_old_one(self):
+        """待定之后只更正非时间事项：旧期限不得恢复，结论仍为无法判定。"""
+
+        pending = detail(
+            "P-001", "01", "extension", "2026-10-10 09:00",
+            "原投标截止时间为2026年11月02日 09:30，因故延期，具体时间另行通知。",
+            "延期公告",
+        )
+        correction = detail(
+            "P-001", "01", "extension", "2026-10-15 09:00",
+            "原投标截止时间 2026年11月02日 09:30 仅作背景引用；本公告仅更正投标保证金账户信息。",
+            "更正公告",
+        )
+        routes = {
+            "/list": link_list(
+                "P-001", "01", ["/d/original"], next_href="/list2"
+            ),
+            "/list2": link_list("P-001", "01", ["/d/pending"], next_href="/list3"),
+            "/list3": link_list("P-001", "01", ["/d/correction"]),
+            "/d/original": ORIGINAL,
+            "/d/pending": pending,
+            "/d/correction": correction,
+        }
+        result = (
+            await check_lot(
+                "http://test/list", "P-001", "01",
+                client_factory=self.make_factory(routes),
+            )
+        ).as_dict()
+        self.assertEqual(result["status"], "unknown")
+        self.assertFalse(result["determinable"])
+        self.assertIsNone(result["effective_deadline"])
+        correction_change = result["changes"][-1]
+        self.assertIsNone(correction_change["deadline_after"])
+        self.assertIn("非时间事项", correction_change["summary"])
+        # The pending notice, not the correction, is flagged as the blocker.
+        self.assertEqual(
+            result["failures"][0]["url"], "http://test/d/pending"
+        )
+
+    async def test_explicit_new_deadline_after_pending_restores_it(self):
+        """待定之后，只有公告明确给出新时间才能恢复有效期限。"""
+
+        pending = detail(
+            "P-001", "01", "extension", "2026-10-10 09:00",
+            "原投标截止时间为2026年11月02日 09:30，因故延期，具体时间另行通知。",
+            "延期公告",
+        )
+        confirmed = detail(
+            "P-001", "01", "extension", "2026-10-18 09:00",
+            "投标截止时间现变更为 2026年11月20日 10:00。",
+            "延期公告",
+        )
+        routes = {
+            "/list": link_list(
+                "P-001", "01", ["/d/original"], next_href="/list2"
+            ),
+            "/list2": link_list("P-001", "01", ["/d/pending"], next_href="/list3"),
+            "/list3": link_list("P-001", "01", ["/d/confirmed"]),
+            "/d/original": ORIGINAL,
+            "/d/pending": pending,
+            "/d/confirmed": confirmed,
+        }
+        result = (
+            await check_lot(
+                "http://test/list", "P-001", "01",
+                client_factory=self.make_factory(routes),
+            )
+        ).as_dict()
+        self.assertEqual(result["status"], "extended")
+        self.assertTrue(result["determinable"])
+        self.assertEqual(result["effective_deadline"], "2026-11-20 10:00")
+        self.assertEqual(
+            result["deadline_source_url"], "http://test/d/confirmed"
+        )
+        after_values = [change["deadline_after"] for change in result["changes"]]
+        self.assertEqual(
+            after_values,
+            ["2026-11-02 09:30", None, "2026-11-20 10:00"],
+        )
+
 
 class ParseTests(unittest.TestCase):
     def test_old_and_new_dates_on_same_line(self):
@@ -223,6 +345,20 @@ class ParseTests(unittest.TestCase):
         parsed = parse_notice_html(text, "http://test/x")
         self.assertFalse(parsed.deadline.explicit)
         self.assertTrue(parsed.deadline.unclear)
+
+    def test_non_time_correction_is_not_a_postponement(self):
+        # The generic extension type tag and a quoted old date must not make a
+        # correction that only touches non-time matters look like a postponement.
+        text = detail(
+            "P-001", "01", "extension", "2026-10-15 09:00",
+            "原投标截止时间 2026年11月02日 09:30 仅作背景引用；本公告仅更正投标保证金账户信息。",
+            "更正公告",
+        )
+        parsed = parse_notice_html(text, "http://test/x")
+        self.assertEqual(parsed.notice_type, "extension")
+        self.assertFalse(parsed.is_postponement)
+        self.assertFalse(parsed.deadline.explicit)
+        self.assertFalse(parsed.deadline.unclear)
 
 
 if __name__ == "__main__":
